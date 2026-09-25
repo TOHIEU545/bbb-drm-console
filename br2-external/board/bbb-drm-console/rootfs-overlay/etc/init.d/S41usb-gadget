@@ -1,0 +1,136 @@
+#!/bin/sh
+
+GADGET_DIR="/sys/kernel/config/usb_gadget/g1"
+CONFIGFS="/sys/kernel/config"
+USB_IP="192.168.20.4/24"
+
+HOST_MAC="02:00:00:00:20:01"
+DEVICE_MAC="02:00:00:00:20:02"
+
+start_gadget()
+{
+    echo "Starting USB Ethernet gadget..."
+
+    # configfs should normally be available, but mount it if needed.
+    if ! grep -qs " $CONFIGFS " /proc/mounts; then
+        mount -t configfs none "$CONFIGFS" || {
+            echo "ERROR: cannot mount configfs"
+            return 1
+        }
+    fi
+
+    # If gadget is already configured, do not recreate it.
+    if [ ! -d "$GADGET_DIR" ]; then
+        mkdir -p "$GADGET_DIR" || return 1
+
+        echo 0x1d6b > "$GADGET_DIR/idVendor"
+        echo 0x0104 > "$GADGET_DIR/idProduct"
+
+        mkdir -p "$GADGET_DIR/strings/0x409"
+        echo "BBB-DRM-001" > "$GADGET_DIR/strings/0x409/serialnumber"
+        echo "BBB DRM Console" > "$GADGET_DIR/strings/0x409/manufacturer"
+        echo "BBB DRM Console USB Ethernet" \
+            > "$GADGET_DIR/strings/0x409/product"
+
+        mkdir -p "$GADGET_DIR/configs/c.1/strings/0x409"
+        echo "ECM Ethernet" \
+            > "$GADGET_DIR/configs/c.1/strings/0x409/configuration"
+
+        mkdir -p "$GADGET_DIR/functions/ecm.usb0"
+
+        echo "$HOST_MAC" \
+            > "$GADGET_DIR/functions/ecm.usb0/host_addr"
+
+        echo "$DEVICE_MAC" \
+            > "$GADGET_DIR/functions/ecm.usb0/dev_addr"
+
+        ln -s "$GADGET_DIR/functions/ecm.usb0" \
+              "$GADGET_DIR/configs/c.1/ecm.usb0"
+    fi
+
+    if [ -z "$(cat "$GADGET_DIR/UDC" 2>/dev/null)" ]; then
+        UDC="$(ls /sys/class/udc 2>/dev/null | head -n 1)"
+
+        if [ -z "$UDC" ]; then
+            echo "ERROR: no USB Device Controller found"
+            return 1
+        fi
+
+        echo "$UDC" > "$GADGET_DIR/UDC" || return 1
+    fi
+
+    # Wait for usb0 created by the ECM function.
+    count=0
+
+    while [ ! -e /sys/class/net/usb0 ]; do
+        count=$((count + 1))
+
+        if [ "$count" -ge 20 ]; then
+            echo "ERROR: usb0 was not created"
+            return 1
+        fi
+
+        sleep 0.1
+    done
+
+    ip link set usb0 down
+
+    # Clear stale addresses in case the service is restarted.
+    ip addr flush dev usb0
+
+    ip addr add "$USB_IP" dev usb0 || return 1
+    ip link set usb0 up || return 1
+
+    echo "USB Ethernet ready: usb0 $USB_IP"
+
+    return 0
+}
+
+stop_gadget()
+{
+    echo "Stopping USB Ethernet gadget..."
+
+    if [ -e /sys/class/net/usb0 ]; then
+        ip link set usb0 down 2>/dev/null
+        ip addr flush dev usb0 2>/dev/null
+    fi
+
+    if [ -d "$GADGET_DIR" ]; then
+        # Unbind from UDC first.
+        if [ -f "$GADGET_DIR/UDC" ]; then
+            echo "" > "$GADGET_DIR/UDC" 2>/dev/null
+        fi
+
+        rm -f "$GADGET_DIR/configs/c.1/ecm.usb0"
+
+        rmdir "$GADGET_DIR/functions/ecm.usb0" 2>/dev/null
+        rmdir "$GADGET_DIR/configs/c.1/strings/0x409" 2>/dev/null
+        rmdir "$GADGET_DIR/configs/c.1" 2>/dev/null
+        rmdir "$GADGET_DIR/strings/0x409" 2>/dev/null
+        rmdir "$GADGET_DIR" 2>/dev/null
+    fi
+
+    return 0
+}
+
+case "$1" in
+    start)
+        start_gadget
+        ;;
+
+    stop)
+        stop_gadget
+        ;;
+
+    restart)
+        stop_gadget
+        start_gadget
+        ;;
+
+    *)
+        echo "Usage: $0 {start|stop|restart}"
+        exit 1
+        ;;
+esac
+
+exit $?
